@@ -1,0 +1,173 @@
+name: Render Ad
+
+# Render rápido de ad, sem tocar na máquina do Marcos.
+#
+# Divide os frames entre N runners do GitHub, cada um renderiza um
+# pedaço e o último job emenda tudo com ffmpeg.
+#
+# Diferenças pro render.yml antigo (que era da VSL):
+#  - a composição vem por input, não fica cravada no YAML
+#  - escala 1: ad é 1080x1920 e o Meta reclama de menos que isso.
+#    O antigo usava 0.7, que entregaria 756x1344.
+#  - os assets vêm do Supabase por URL, então o checkout é só código
+#    (com os vídeos em public/ seriam 773MB baixados por worker)
+
+on:
+  workflow_dispatch:
+    inputs:
+      composition:
+        description: "id da composição (ex: ad2b-friends-s01e01-6)"
+        required: true
+      frames:
+        description: "total de frames da composição"
+        required: true
+      workers:
+        description: "runners em paralelo"
+        required: false
+        default: "10"
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.value }}
+    steps:
+      - id: matrix
+        run: |
+          WORKERS=${{ github.event.inputs.workers }}
+          TOTAL=${{ github.event.inputs.frames }}
+          CHUNK=$(( (TOTAL + WORKERS - 1) / WORKERS ))
+          JSON="["
+          for i in $(seq 0 $(( WORKERS - 1 ))); do
+            START=$(( i * CHUNK ))
+            END=$(( START + CHUNK ))
+            if [ $END -gt $TOTAL ]; then END=$TOTAL; fi
+            if [ $START -ge $TOTAL ]; then break; fi
+            if [ "$JSON" != "[" ]; then JSON="$JSON,"; fi
+            JSON="$JSON{\"index\":$i,\"start\":$START,\"end\":$END}"
+          done
+          JSON="$JSON]"
+          echo "value=$JSON" >> "$GITHUB_OUTPUT"
+
+  render:
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        chunk: ${{ fromJson(needs.setup.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - run: npm ci
+
+      - name: Render chunk ${{ matrix.chunk.index }}
+        run: |
+          npx remotion render src/index.ts \
+            "${{ github.event.inputs.composition }}" \
+            "out/chunk-${{ matrix.chunk.index }}.mp4" \
+            --image-format=jpeg --jpeg-quality=95 --scale=1 \
+            --timeout=900000 --concurrency=2 --muted \
+            --frames=${{ matrix.chunk.start }}-$(( ${{ matrix.chunk.end }} - 1 ))
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chunk-${{ matrix.chunk.index }}
+          path: out/chunk-${{ matrix.chunk.index }}.mp4
+          retention-days: 1
+
+  # O áudio inteiro sai de uma vez, num job só. É rápido porque não
+  # renderiza frame nenhum, e garante uma trilha contínua — sem
+  # emenda, sem padding, sem deriva.
+  audio:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci
+      - name: Render áudio completo
+        run: |
+          npx remotion render src/index.ts             "${{ github.event.inputs.composition }}"             "out/trilha.mp3" --codec=mp3 --timeout=900000
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trilha
+          path: out/trilha.mp3
+          retention-days: 1
+
+  stitch:
+    needs: [setup, render, audio]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: chunk-*
+          path: chunks/
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: trilha
+          path: trilha/
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Stitch chunks
+        run: |
+          WORKERS=${{ github.event.inputs.workers }}
+          COMP="${{ github.event.inputs.composition }}"
+          ESPERADO=${{ github.event.inputs.frames }}
+
+          # Os pedaços são só VÍDEO (renderizados com --muted) e a
+          # trilha vem inteira de um job só. Assim não existe emenda de
+          # áudio nenhuma: a única junção é de imagem.
+          INPUTS=""
+          FILTRO=""
+          N=0
+          for i in $(seq 0 $(( WORKERS - 1 ))); do
+            FILE="chunks/chunk-$i/chunk-$i.mp4"
+            if [ -f "$FILE" ]; then
+              INPUTS="$INPUTS -i $FILE"
+              FILTRO="$FILTRO[$N:v]"
+              N=$(( N + 1 ))
+            fi
+          done
+          echo "pedaços de vídeo: $N"
+
+          # setpts depois do concat crava o tempo de cada frame em N/30,
+          # ignorando o timestamp que veio no pedaço. Sem isso o ffmpeg
+          # acha que cada chunk dura um tiquinho mais que frames÷30 e
+          # DUPLICA frame pra preencher — foi o "dup=16" que transformou
+          # 991 frames em 1007.
+          ffmpeg -y $INPUTS -i trilha/trilha.mp3 \
+            -filter_complex "${FILTRO}concat=n=$N:v=1:a=0[vc];[vc]setpts=N/30/TB[v]" \
+            -map "[v]" -map "$N:a" \
+            -fps_mode passthrough -frames:v "$ESPERADO" \
+            -c:v libx264 -preset medium -crf 18 -pix_fmt yuv420p \
+            -c:a aac -b:a 192k \
+            -video_track_timescale 30000 \
+            "$COMP.mp4"
+
+          # o render só serve se tiver exatamente os frames pedidos
+          REAL=$(ffprobe -v error -select_streams v:0 -count_frames \
+            -show_entries stream=nb_read_frames -of csv=p=0 "$COMP.mp4" | tr -dc "0-9")
+          echo "frames: $REAL (esperado $ESPERADO)"
+          if [ "$REAL" != "$ESPERADO" ]; then
+            echo "ERRO: contagem de frames não bate com a composição."
+            exit 1
+          fi
+          ls -lh "$COMP.mp4"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.composition }}
+          path: ${{ github.event.inputs.composition }}.mp4
+          retention-days: 7

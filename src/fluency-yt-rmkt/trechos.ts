@@ -1,0 +1,2 @@
+// GERADO por _versoes-1411/gerar.mjs (14/11): versão FULL, trechos do ORIGINAL cravados no envelope e conferidos por transcrição.
+export const TRECHOS:{de:number;ate:number;n:number;z?:number}[]=[{"de":0.45,"ate":131.77,"n":1},{"de":137.39,"ate":264.47,"n":37},{"de":269.55,"ate":1457.62,"n":98},{"de":1488.08,"ate":2157.75,"n":560},{"de":2161.42,"ate":2201.75,"n":783},{"de":2216.53,"ate":2379.27,"n":802},{"de":2386.1,"ate":2627.85,"n":856},{"de":2631.1,"ate":2676.48,"n":916},{"de":2686.38,"ate":3054.4,"n":938}];
