@@ -68,12 +68,15 @@ jobs:
 
       - name: Render chunk ${{ matrix.chunk.index }}
         run: |
+          for TENTA in 1 2 3; do
           npx remotion render src/index.ts \
             "${{ github.event.inputs.composition }}" \
             "out/chunk-${{ matrix.chunk.index }}.mp4" \
             --image-format=jpeg --jpeg-quality=95 --scale=1 \
             --timeout=900000 --concurrency=2 --muted \
-            --frames=${{ matrix.chunk.start }}-$(( ${{ matrix.chunk.end }} - 1 ))
+            --frames=${{ matrix.chunk.start }}-$(( ${{ matrix.chunk.end }} - 1 )) && break
+          echo "tentativa $TENTA falhou"; [ $TENTA = 3 ] && exit 1; sleep 20
+          done
 
       - uses: actions/upload-artifact@v4
         with:
@@ -86,7 +89,7 @@ jobs:
   # emenda, sem padding, sem deriva.
   audio:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
